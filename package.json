@@ -1,0 +1,20 @@
+{
+  "name": "genuine-undead-relay",
+  "version": "1.0.0",
+  "description": "Relais entre OpenSea Stream API et la page genuineundeadcometolife.html",
+  "type": "module",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "@opensea/stream-js": "^0.2.1",
+    "dotenv": "^16.4.5",
+    "express": "^4.19.2",
+    "node-localstorage": "^3.0.5",
+    "ws": "^8.17.0"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}
