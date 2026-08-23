@@ -1,7 +1,7 @@
 {
   "name": "genuine-undead-relay",
   "version": "1.0.0",
-  "description": "Relais entre OpenSea Stream API et la page genuineundeadcometolife.html",
+  "description": "Relais entre OpenSea Stream API et la page genuineundeadcube.html",
   "type": "module",
   "main": "server.js",
   "scripts": {
