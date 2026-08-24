@@ -80,7 +80,7 @@ function recordBroadcast(tokenId, type, timestamp) {
 // WebSocket something to catch up on; it can be shorter than 24h on a
 // busy day, or hold stale entries during a quiet one. This log is
 // capped by TIME instead, so GET /recent-events (below) can always
-// answer "every sale / accepted offer / new offer in the last 24h",
+// answer "every sale / new offer in the last 24h",
 // which is what the frontend needs to make every concerned Genuine
 // Undead blink on page load - not just the last N events.
 // -----------------------------------------------------------------
@@ -111,7 +111,7 @@ function broadcastEvent(tokenId, type, timestampMs) {
   broadcast({ tokenIndex: tokenIdToIndex(tokenId), type, timestamp: ts });
 }
 
-// GET /recent-events: every sale / accepted offer / new offer
+// GET /recent-events: every sale / new offer
 // broadcast in the last 24h, regardless of whether a browser was
 // connected when it happened. This is what events.js fetches once on
 // every page load so all concerned Genuine Undead blink on arrival,
@@ -187,21 +187,21 @@ client.onItemReceivedOffer(COLLECTION_SLUG, (event) => {
   broadcastEvent(tokenId, 'offer');
 });
 
-client.onItemReceivedBid(COLLECTION_SLUG, (event) => {
-  // "accepted offer" only ever comes from the live stream: OpenSea's
-  // REST events endpoint has no event_type that distinguishes an
-  // accepted bid from a regular sale, so the polling backstop below
-  // can never reconstruct this one if it's missed. Documented gap.
-  const tokenId = extractTokenId(event.payload.item.nft_id);
-  broadcastEvent(tokenId, 'auction');
-});
-
+// REMOVED (2026-08-24): onItemReceivedBid ("accepted offer") is gone
+// for good. OpenSea's stream API has no way to tell apart a real ETH
+// sale at the listed price from a WETH offer the owner accepted -
+// both fire as different events but there's no reliable signal to
+// split them into their own trustworthy category, client- or
+// server-side. Rather than keep a bucket that would be silently
+// wrong for some events, "accepted offer" was dropped entirely: no
+// subscription, no color, no legend entry (see config.js).
+//
 // NOTE (2026-08-24): onItemListed (listings) and onItemTransferred
 // (mint/transfer) subscriptions were removed on purpose. Monitored
-// activity is now exactly 3 categories - sale, accepted offer, new
-// offer - see EVENT_COLORS/EVENT_LABELS in config.js. A listing or a
-// transfer no longer pulses the cube, no longer appears in the
-// legend, and is no longer polled below.
+// activity is now exactly 2 categories - sale, new offer - see
+// EVENT_COLORS/EVENT_LABELS in config.js. A listing or a transfer no
+// longer pulses the cube, no longer appears in the legend, and is no
+// longer polled below.
 
 console.log(`Ecoute des evenements OpenSea pour ${COLLECTION_SLUG}...`);
 
@@ -255,7 +255,7 @@ function buildEventsUrl(since, eventTypes) {
 }
 
 // Only these OpenSea event_type values map onto the site's legend
-// (sale / accepted offer / new offer - see config.js EVENT_COLORS).
+// (sale / new offer - see config.js EVENT_COLORS).
 // "listing", "transfer", "cancel", "redemption" and any unrecognized
 // raw "order" have no bucket in the UI anymore and are ignored here -
 // removed on purpose so a listing or a mint/transfer can never make a
@@ -301,7 +301,7 @@ async function pollEvents(eventTypes, sinceState, label) {
 // boot/wake (including after a free-tier Render cold start), this
 // makes the very first poll backfill a full day of sales/offers
 // instead of just the last hour - which is what actually powers "see
-// every sale / accepted offer / new offer from the last 24h blink",
+// every sale / new offer from the last 24h stay lit",
 // since the live stream alone can only ever show events for the
 // exact time window this process happens to be awake and connected.
 const salesPollState = { after: Math.floor(Date.now() / 1000) - DAY_MS / 1000 };
@@ -320,6 +320,57 @@ pollOffers();  // idem pour les nouvelles offres
 
 setInterval(pollSales, SALE_POLL_INTERVAL_MS);
 setInterval(pollOffers, OFFER_POLL_INTERVAL_MS);
+
+// -----------------------------------------------------------------
+// TRAIT RARITY (collection-wide)
+// The per-NFT endpoint used below (GET /nfts/{identifier}) returns
+// each trait's type/value but never a count or a rarity % against
+// the collection - that data only exists on OpenSea's separate
+// collection-traits endpoint. Without this, the panel had traits but
+// no rarity %, unlike the OpenSea page for the same token.
+//
+// GET /api/v2/traits/{slug} returns { categories, counts } where
+// counts is { trait_type: { value: numberOfNftsWithThatValue } } -
+// exactly the shape normalizeTraits() in events.js already expects
+// as "collectionTraits" (it divides count by TOTAL_TOKENS to get %).
+//
+// Cached with a 1h TTL: these counts only change on a reveal, a burn,
+// or new mints - never on every panel open - so refetching per
+// request would just be wasted calls against the rate limit. On a
+// failed refresh, the previous (even if stale) cached counts keep
+// being served rather than wiping out rarity data for every open
+// panel over one transient OpenSea hiccup.
+// -----------------------------------------------------------------
+const TRAIT_STATS_TTL_MS = 60 * 60 * 1000;
+let traitStatsCache = { counts: null, fetchedAt: 0 };
+
+async function getCollectionTraitCounts() {
+  const isFresh = traitStatsCache.counts && (Date.now() - traitStatsCache.fetchedAt) < TRAIT_STATS_TTL_MS;
+  if (isFresh) return traitStatsCache.counts;
+  try {
+    const res = await fetch(`https://api.opensea.io/api/v2/traits/${COLLECTION_SLUG}`, {
+      headers: { 'x-api-key': OPENSEA_API_KEY }
+    });
+    if (!res.ok) {
+      // Surface the response body too, not just the status: a 401/403
+      // here usually means the API key's tier doesn't include this
+      // endpoint, which a bare status code doesn't make obvious.
+      const body = await res.text().catch(() => '');
+      throw new Error(`traits HTTP ${res.status}${body ? ` - ${body.slice(0, 300)}` : ''}`);
+    }
+    const data = await res.json();
+    if (data && data.counts) {
+      traitStatsCache = { counts: data.counts, fetchedAt: Date.now() };
+      console.log(`[relay] collection traits refreshed: ${Object.keys(data.counts).length} trait categories cached.`);
+    } else {
+      console.warn('[relay] collection traits response had no "counts" field:', JSON.stringify(data).slice(0, 300));
+    }
+  } catch (err) {
+    console.error('[relay] collection traits fetch failed:', err.message || err);
+  }
+  return traitStatsCache.counts;
+}
+getCollectionTraitCounts(); // warm the cache at boot instead of on the first click
 
 // -----------------------------------------------------------------
 // HISTORIQUE D'UN TOKEN (appele au clic sur la page)
@@ -376,15 +427,20 @@ app.get('/token/:index', async (req, res) => {
     console.error(`[relay] /token/${tokenIndex}: events fetch failed:`, err.message || err);
   }
 
+  const collectionTraits = await getCollectionTraitCounts();
+
   // Forward the raw material instead of pre-digesting it into "rows":
   // the client (events.js normalizeHistory/normalizeTraits) already
   // builds the history summary AND the traits grid from exactly this
   // shape (nft.traits + asset_events), and now also gets eventsError
-  // to tell a real failure apart from genuinely-empty history.
+  // to tell a real failure apart from genuinely-empty history, plus
+  // collectionTraits so normalizeTraits() can attach a rarity % to
+  // each trait card instead of leaving it blank.
   res.json({
     imageUrl: nftData?.nft?.image_url || null,
     traits: nftData?.nft?.traits || [],
     events: eventsData.asset_events || [],
-    eventsError
+    eventsError,
+    collectionTraits
   });
 });
