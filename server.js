@@ -266,8 +266,11 @@ console.log(`Ecoute des evenements OpenSea pour ${COLLECTION_SLUG}...`);
 // split, both deliberate:
 //   - a sale query with event_type=sale is a smaller, cheaper request
 //     that isn't competing/paginated against listing/offer/transfer
-//     noise, so it's less likely to silently truncate at limit=50
-//     and drop a real sale off the page during a busy window.
+//     noise. pollEvents() below also now follows OpenSea's own
+//     pagination cursor (see MAX_EVENT_PAGES), so a busy window no
+//     longer silently truncates at the API's 50-item page size either
+//     - the two together are what keeps a real sale from ever being
+//     dropped off the page.
 //   - each cycle's lookback window overlaps its own previous run by
 //     a fixed buffer (OVERLAP_SECONDS) instead of starting exactly
 //     where the last run ended - a process that stalls, GCs, or is
@@ -292,9 +295,12 @@ const OVERLAP_SECONDS = 5 * 60; // marge de recouvrement anti-trou en bordure d'
 
 // Builds a collection-events URL for one or several OpenSea
 // event_type values (repeated query param, as the API expects).
-function buildEventsUrl(since, eventTypes) {
+// cursor is OpenSea's own pagination token (its response's "next"
+// field) - omitted for the first page of a poll cycle.
+function buildEventsUrl(since, eventTypes, cursor) {
   const params = new URLSearchParams({ after: String(since), limit: '50' });
   eventTypes.forEach((t) => params.append('event_type', t));
+  if (cursor) params.set('next', cursor);
   return `https://api.opensea.io/api/v2/events/collection/${COLLECTION_SLUG}?${params.toString()}`;
 }
 
@@ -312,30 +318,52 @@ function mapEventType(openseaEventType) {
   }
 }
 
+// BUG FIXED HERE (2026-08-27): this used to fetch a single 50-item
+// page and stop - the comment above (SPLIT CADENCE) already flagged
+// that as a truncation risk "less likely" to bite, but never actually
+// closed it. OpenSea returns events newest-first, so on any lookback
+// window with MORE than 50 matching sales, the events silently
+// dropped are always the OLDER ones. That's exactly the 24h-48h slice
+// GET /recent-sales-48h depends on: the blue overlay could end up
+// with nothing to show even with the lookback correctly widened to
+// 48h (see salesPollState below), simply because the 50-cap on page 1
+// never let the poll reach back that far in the first place. This now
+// follows OpenSea's own pagination cursor (the response's "next"
+// field) until either it's exhausted or MAX_PAGES is hit - the cap
+// exists only to guarantee the loop can never spin forever against a
+// misbehaving cursor, not as a realistic ceiling.
+const MAX_EVENT_PAGES = 20; // 20 * 50 = up to 1000 events per poll cycle
+
 async function pollEvents(eventTypes, sinceState, label) {
   const since = sinceState.after - OVERLAP_SECONDS;
   sinceState.after = Math.floor(Date.now() / 1000);
+  let cursor = null;
+  let page = 0;
   try {
-    const res = await fetch(buildEventsUrl(since, eventTypes), {
-      headers: { 'x-api-key': OPENSEA_API_KEY }
-    });
-    if (!res.ok) throw new Error(`${label} poll HTTP ${res.status}`);
-    const data = await res.json();
-    for (const ev of (data.asset_events || [])) {
-      const type = mapEventType(ev.event_type);
-      const tokenId = ev.nft?.identifier;
-      if (!type || !tokenId) continue;
-      const key = `${ev.event_type}:${tokenId}:${ev.event_timestamp}`;
-      if (seenEventKeys.has(key)) continue;
-      markSeen(key);
-      // Use the event's own OpenSea timestamp (when the sale/offer
-      // actually happened), not "now" (when this poll noticed it) -
-      // so /recent-events and the ring buffer both reflect real
-      // event time, which matters for a backfilled event that could
-      // be hours old.
-      const tsMs = ev.event_timestamp ? Date.parse(ev.event_timestamp) : Date.now();
-      broadcastEvent(tokenId, type, Number.isFinite(tsMs) ? tsMs : Date.now());
-    }
+    do {
+      const res = await fetch(buildEventsUrl(since, eventTypes, cursor), {
+        headers: { 'x-api-key': OPENSEA_API_KEY }
+      });
+      if (!res.ok) throw new Error(`${label} poll HTTP ${res.status} (page ${page + 1})`);
+      const data = await res.json();
+      for (const ev of (data.asset_events || [])) {
+        const type = mapEventType(ev.event_type);
+        const tokenId = ev.nft?.identifier;
+        if (!type || !tokenId) continue;
+        const key = `${ev.event_type}:${tokenId}:${ev.event_timestamp}`;
+        if (seenEventKeys.has(key)) continue;
+        markSeen(key);
+        // Use the event's own OpenSea timestamp (when the sale/offer
+        // actually happened), not "now" (when this poll noticed it) -
+        // so /recent-events and the ring buffer both reflect real
+        // event time, which matters for a backfilled event that could
+        // be hours (or with the 48h sales lookback, up to two days) old.
+        const tsMs = ev.event_timestamp ? Date.parse(ev.event_timestamp) : Date.now();
+        broadcastEvent(tokenId, type, Number.isFinite(tsMs) ? tsMs : Date.now());
+      }
+      cursor = data.next || null;
+      page += 1;
+    } while (cursor && page < MAX_EVENT_PAGES);
   } catch (err) {
     console.error(`[relay] ${label} poll failed:`, err.message || err);
   }
