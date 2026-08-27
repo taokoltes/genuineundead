@@ -97,10 +97,34 @@ function recordDailyEvent(tokenId, type, timestamp) {
   pruneDailyEvents();
 }
 
+// -----------------------------------------------------------------
+// "SALES 48H" LOG — sales only, kept for twice as long as dailyEvents
+// above. Powers GET /recent-sales-48h further down, which only
+// returns the OLDER half of this window (24h-48h ago): the newer half
+// is exactly what /recent-events (and the pink cube treatment) above
+// already cover, so this endpoint only ever adds the "extra" day of
+// history the blue "sales 48h" button asks for - fetched on demand
+// only when that button is clicked (see events.js), never pushed
+// automatically the way the 24h catch-up is.
+// -----------------------------------------------------------------
+const TWO_DAY_MS = 2 * DAY_MS;
+const salesLog48h = []; // oldest first: { tokenId, timestamp } — sales only
+
+function pruneSalesLog48h() {
+  const cutoff = Date.now() - TWO_DAY_MS;
+  while (salesLog48h.length && salesLog48h[0].timestamp < cutoff) salesLog48h.shift();
+}
+
+function recordSalesLog48h(tokenId, type, timestamp) {
+  if (type !== 'sale') return; // "sales 48h" is sales only, never offers
+  salesLog48h.push({ tokenId, timestamp: timestamp || Date.now() });
+  pruneSalesLog48h();
+}
+
 // Every live event (stream or REST backstop) goes through this
-// single function, so both the ring buffer and the 24h log always
-// reflect exactly what was actually broadcast. timestampMs is
-// optional - live stream events happening right now omit it and
+// single function, so the ring buffer, the 24h log and the 48h sales
+// log always reflect exactly what was actually broadcast. timestampMs
+// is optional - live stream events happening right now omit it and
 // default to "now"; the REST backstop below passes the event's real
 // on-chain/OpenSea timestamp so /recent-events reflects when things
 // actually happened, not when this process happened to poll for them.
@@ -108,6 +132,7 @@ function broadcastEvent(tokenId, type, timestampMs) {
   const ts = timestampMs || Date.now();
   recordBroadcast(tokenId, type, ts);
   recordDailyEvent(tokenId, type, ts);
+  recordSalesLog48h(tokenId, type, ts);
   broadcast({ tokenIndex: tokenIdToIndex(tokenId), type, timestamp: ts });
 }
 
@@ -124,6 +149,25 @@ app.get('/recent-events', (req, res) => {
       type: e.type,
       timestamp: e.timestamp
     }))
+  });
+});
+
+// GET /recent-sales-48h: sales broadcast between 24h and 48h ago only
+// - the older half of the window, additive to whatever /recent-events
+// (last 24h) already covers. Fetched on demand only, when the blue
+// "sales 48h" button is clicked client-side (see events.js) - never
+// on page load, unlike /recent-events above.
+app.get('/recent-sales-48h', (req, res) => {
+  pruneSalesLog48h();
+  const cutoff24h = Date.now() - DAY_MS;
+  res.json({
+    events: salesLog48h
+      .filter((e) => e.timestamp < cutoff24h)
+      .map((e) => ({
+        tokenIndex: tokenIdToIndex(e.tokenId),
+        type: 'sale',
+        timestamp: e.timestamp
+      }))
   });
 });
 
