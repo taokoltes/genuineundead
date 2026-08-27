@@ -348,7 +348,17 @@ async function pollEvents(eventTypes, sinceState, label) {
 // every sale / new offer from the last 24h stay lit",
 // since the live stream alone can only ever show events for the
 // exact time window this process happens to be awake and connected.
-const salesPollState = { after: Math.floor(Date.now() / 1000) - DAY_MS / 1000 };
+//
+// SALES widened again to 48h (2026-08-27): the blue "sales 48h"
+// overlay's GET /recent-sales-48h only ever returns the OLDER half of
+// its own 48h window (24h-48h ago - see salesLog48h above), which a
+// 24h-only backfill can never populate on its own. Without this, the
+// blue button had nothing to show until the relay had already been
+// running live, uninterrupted, for a further 24h past its last
+// restart - which read as "the feature doesn't work" even though the
+// client-side code was correct. Offers don't feed that overlay, so
+// their own lookback stays at 24h.
+const salesPollState = { after: Math.floor(Date.now() / 1000) - TWO_DAY_MS / 1000 };
 const offersPollState = { after: Math.floor(Date.now() / 1000) - DAY_MS / 1000 };
 
 function pollSales() {
