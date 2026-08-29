@@ -318,6 +318,8 @@ async function pollEvents(eventTypes, sinceState, label) {
   sinceState.after = Math.floor(Date.now() / 1000);
   let cursor = null;
   let page = 0;
+  let rawCount = 0;
+  let broadcastCount = 0;
   try {
     do {
       const res = await fetch(buildEventsUrl(since, eventTypes, cursor), {
@@ -325,7 +327,9 @@ async function pollEvents(eventTypes, sinceState, label) {
       });
       if (!res.ok) throw new Error(`${label} poll HTTP ${res.status} (page ${page + 1})`);
       const data = await res.json();
-      for (const ev of (data.asset_events || [])) {
+      const events = data.asset_events || [];
+      rawCount += events.length;
+      for (const ev of events) {
         const type = mapEventType(ev.event_type);
         const tokenId = ev.nft?.identifier;
         if (!type || !tokenId) continue;
@@ -339,10 +343,19 @@ async function pollEvents(eventTypes, sinceState, label) {
         // be hours old.
         const tsMs = ev.event_timestamp ? parseOpenSeaTimestamp(ev.event_timestamp) : Date.now();
         broadcastEvent(tokenId, type, Number.isFinite(tsMs) ? tsMs : Date.now());
+        broadcastCount += 1;
       }
       cursor = data.next || null;
       page += 1;
     } while (cursor && page < MAX_EVENT_PAGES);
+    // Visible either way now, not just on failure - this line alone
+    // tells us whether OpenSea returned nothing at all (rawCount: 0 -
+    // a query/slug/lookback problem), returned events that all got
+    // filtered out (rawCount > 0, broadcastCount: 0 - a
+    // mapEventType/dedup problem), or genuinely broadcast sales (in
+    // which case a still-empty /recent-events points further downstream,
+    // at dailyEvents itself or the endpoint reading it).
+    console.log(`[relay] ${label} poll: ${rawCount} raw event(s) across ${page} page(s), ${broadcastCount} broadcast`);
   } catch (err) {
     console.error(`[relay] ${label} poll failed:`, err.message || err);
   }
