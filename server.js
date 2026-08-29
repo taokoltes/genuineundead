@@ -97,34 +97,10 @@ function recordDailyEvent(tokenId, type, timestamp) {
   pruneDailyEvents();
 }
 
-// -----------------------------------------------------------------
-// "SALES 48H" LOG — sales only, kept for twice as long as dailyEvents
-// above. Powers GET /recent-sales-48h further down, which only
-// returns the OLDER half of this window (24h-48h ago): the newer half
-// is exactly what /recent-events (and the pink cube treatment) above
-// already cover, so this endpoint only ever adds the "extra" day of
-// history the blue "sales 48h" button asks for - fetched on demand
-// only when that button is clicked (see events.js), never pushed
-// automatically the way the 24h catch-up is.
-// -----------------------------------------------------------------
-const TWO_DAY_MS = 2 * DAY_MS;
-const salesLog48h = []; // oldest first: { tokenId, timestamp } — sales only
-
-function pruneSalesLog48h() {
-  const cutoff = Date.now() - TWO_DAY_MS;
-  while (salesLog48h.length && salesLog48h[0].timestamp < cutoff) salesLog48h.shift();
-}
-
-function recordSalesLog48h(tokenId, type, timestamp) {
-  if (type !== 'sale') return; // "sales 48h" is sales only, never offers
-  salesLog48h.push({ tokenId, timestamp: timestamp || Date.now() });
-  pruneSalesLog48h();
-}
-
 // Every live event (stream or REST backstop) goes through this
-// single function, so the ring buffer, the 24h log and the 48h sales
-// log always reflect exactly what was actually broadcast. timestampMs
-// is optional - live stream events happening right now omit it and
+// single function, so both the ring buffer and the 24h log always
+// reflect exactly what was actually broadcast. timestampMs is
+// optional - live stream events happening right now omit it and
 // default to "now"; the REST backstop below passes the event's real
 // on-chain/OpenSea timestamp so /recent-events reflects when things
 // actually happened, not when this process happened to poll for them.
@@ -132,7 +108,6 @@ function broadcastEvent(tokenId, type, timestampMs) {
   const ts = timestampMs || Date.now();
   recordBroadcast(tokenId, type, ts);
   recordDailyEvent(tokenId, type, ts);
-  recordSalesLog48h(tokenId, type, ts);
   broadcast({ tokenIndex: tokenIdToIndex(tokenId), type, timestamp: ts });
 }
 
@@ -149,25 +124,6 @@ app.get('/recent-events', (req, res) => {
       type: e.type,
       timestamp: e.timestamp
     }))
-  });
-});
-
-// GET /recent-sales-48h: sales broadcast between 24h and 48h ago only
-// - the older half of the window, additive to whatever /recent-events
-// (last 24h) already covers. Fetched on demand only, when the blue
-// "sales 48h" button is clicked client-side (see events.js) - never
-// on page load, unlike /recent-events above.
-app.get('/recent-sales-48h', (req, res) => {
-  pruneSalesLog48h();
-  const cutoff24h = Date.now() - DAY_MS;
-  res.json({
-    events: salesLog48h
-      .filter((e) => e.timestamp < cutoff24h)
-      .map((e) => ({
-        tokenIndex: tokenIdToIndex(e.tokenId),
-        type: 'sale',
-        timestamp: e.timestamp
-      }))
   });
 });
 
@@ -320,19 +276,42 @@ function mapEventType(openseaEventType) {
 
 // BUG FIXED HERE (2026-08-27): this used to fetch a single 50-item
 // page and stop - the comment above (SPLIT CADENCE) already flagged
-// that as a truncation risk "less likely" to bite, but never actually
-// closed it. OpenSea returns events newest-first, so on any lookback
-// window with MORE than 50 matching sales, the events silently
-// dropped are always the OLDER ones. That's exactly the 24h-48h slice
-// GET /recent-sales-48h depends on: the blue overlay could end up
-// with nothing to show even with the lookback correctly widened to
-// 48h (see salesPollState below), simply because the 50-cap on page 1
-// never let the poll reach back that far in the first place. This now
+// that as a truncation risk, but never actually closed it. OpenSea
+// returns events newest-first, so on any lookback window with MORE
+// than 50 matching sales, the events silently dropped are always the
+// OLDER ones - meaning a genuinely busy window could leave real sales
+// permanently unrecorded, since the overlap-based catch-up on the
+// next cycle only looks a few minutes further back (OVERLAP_SECONDS),
+// not far enough to ever recover a page-1 truncation. This now
 // follows OpenSea's own pagination cursor (the response's "next"
-// field) until either it's exhausted or MAX_PAGES is hit - the cap
-// exists only to guarantee the loop can never spin forever against a
-// misbehaving cursor, not as a realistic ceiling.
+// field) until either it's exhausted or MAX_EVENT_PAGES is hit - the
+// cap exists only to guarantee the loop can never spin forever
+// against a misbehaving cursor, not as a realistic ceiling.
 const MAX_EVENT_PAGES = 20; // 20 * 50 = up to 1000 events per poll cycle
+
+// Parses OpenSea's own event_timestamp field, which is NOT consistent
+// in format across their two APIs:
+//   - REST (/events) - a unix-seconds NUMBER, e.g. 1735678900. This is
+//     confirmed straight from OpenSea's own opensea-js SDK reference
+//     docs, which read the field back as
+//     `new Date(event.event_timestamp * 1000)`.
+//   - Stream (WebSocket) - an ISO 8601 STRING, e.g.
+//     "2022-12-01T16:54:23.974726+00:00".
+// pollEvents() below only ever talks to the REST endpoint, so it
+// should always be the numeric case - but this also accepts a numeric
+// or ISO string defensively, in case OpenSea's REST response ever
+// changes shape. Returns NaN (not a throw) on anything unrecognized,
+// exactly like Date.parse() would, so the caller's existing
+// Number.isFinite() fallback to Date.now() still applies unchanged.
+function parseOpenSeaTimestamp(value) {
+  if (value === null || value === undefined) return NaN;
+  if (typeof value === 'number') return value * 1000;
+  if (typeof value === 'string') {
+    if (/^\d+$/.test(value)) return Number(value) * 1000; // numeric string
+    return Date.parse(value); // ISO 8601 string
+  }
+  return NaN;
+}
 
 async function pollEvents(eventTypes, sinceState, label) {
   const since = sinceState.after - OVERLAP_SECONDS;
@@ -357,8 +336,8 @@ async function pollEvents(eventTypes, sinceState, label) {
         // actually happened), not "now" (when this poll noticed it) -
         // so /recent-events and the ring buffer both reflect real
         // event time, which matters for a backfilled event that could
-        // be hours (or with the 48h sales lookback, up to two days) old.
-        const tsMs = ev.event_timestamp ? Date.parse(ev.event_timestamp) : Date.now();
+        // be hours old.
+        const tsMs = ev.event_timestamp ? parseOpenSeaTimestamp(ev.event_timestamp) : Date.now();
         broadcastEvent(tokenId, type, Number.isFinite(tsMs) ? tsMs : Date.now());
       }
       cursor = data.next || null;
@@ -376,17 +355,7 @@ async function pollEvents(eventTypes, sinceState, label) {
 // every sale / new offer from the last 24h stay lit",
 // since the live stream alone can only ever show events for the
 // exact time window this process happens to be awake and connected.
-//
-// SALES widened again to 48h (2026-08-27): the blue "sales 48h"
-// overlay's GET /recent-sales-48h only ever returns the OLDER half of
-// its own 48h window (24h-48h ago - see salesLog48h above), which a
-// 24h-only backfill can never populate on its own. Without this, the
-// blue button had nothing to show until the relay had already been
-// running live, uninterrupted, for a further 24h past its last
-// restart - which read as "the feature doesn't work" even though the
-// client-side code was correct. Offers don't feed that overlay, so
-// their own lookback stays at 24h.
-const salesPollState = { after: Math.floor(Date.now() / 1000) - TWO_DAY_MS / 1000 };
+const salesPollState = { after: Math.floor(Date.now() / 1000) - DAY_MS / 1000 };
 const offersPollState = { after: Math.floor(Date.now() / 1000) - DAY_MS / 1000 };
 
 function pollSales() {
