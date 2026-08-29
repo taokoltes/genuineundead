@@ -260,6 +260,31 @@ function buildEventsUrl(since, eventTypes, cursor) {
   return `https://api.opensea.io/api/v2/events/collection/${COLLECTION_SLUG}?${params.toString()}`;
 }
 
+// -----------------------------------------------------------------
+// TEMPORARY DIAGNOSTIC ENDPOINT (2026-08-29) — remove once the
+// "0 raw events" mystery is solved. Makes the exact same request
+// pollSales() makes and hands back OpenSea's raw response so it can
+// be inspected from a plain browser tab, since Shell access needs a
+// paid Render plan. Never exposes OPENSEA_API_KEY - the key is only
+// ever sent as a request header, never present in the URL or in
+// anything reflected back here.
+// -----------------------------------------------------------------
+app.get('/debug-opensea', async (req, res) => {
+  const since = Math.floor(Date.now() / 1000) - DAY_MS / 1000 - OVERLAP_SECONDS;
+  const url = buildEventsUrl(since, ['sale'], null);
+  try {
+    const openseaRes = await fetch(url, { headers: { 'x-api-key': OPENSEA_API_KEY } });
+    const bodyText = await openseaRes.text();
+    res.status(200).json({
+      requestUrl: url,
+      openseaStatus: openseaRes.status,
+      openseaBody: bodyText
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.message || String(err) });
+  }
+});
+
 // Only these OpenSea event_type values map onto the site's legend
 // (sale / new offer - see config.js EVENT_COLORS).
 // "listing", "transfer", "cancel", "redemption" and any unrecognized
