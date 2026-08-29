@@ -97,6 +97,46 @@ function recordDailyEvent(tokenId, type, timestamp) {
   pruneDailyEvents();
 }
 
+// -----------------------------------------------------------------
+// "LAST SALE EVER" — deliberately independent of the 24h dailyEvents
+// window above. The pink 24h treatment is correctly scoped to 24h
+// (that's the whole point of it), but "last sale" means exactly what
+// it says: the single most recent sale, however long ago that was -
+// a collection with zero sales in the last 24h should still show its
+// real last sale, not nothing. Updated two ways: live, the instant
+// any new sale is broadcast (see broadcastEvent below); and once at
+// boot via pollLastSaleEver()'s own unrestricted query (no 'after'
+// cutoff at all), so a fresh restart doesn't sit empty until the next
+// sale happens to occur.
+// -----------------------------------------------------------------
+let lastSaleEver = null; // { tokenId, timestamp } | null
+
+function noteLastSaleEver(tokenId, timestamp) {
+  if (lastSaleEver && timestamp <= lastSaleEver.timestamp) return;
+  lastSaleEver = { tokenId, timestamp };
+}
+
+async function pollLastSaleEver() {
+  try {
+    const params = new URLSearchParams({ limit: '1', event_type: 'sale' });
+    const url = `https://api.opensea.io/api/v2/events/collection/${COLLECTION_SLUG}?${params.toString()}`;
+    const res = await fetch(url, { headers: { 'x-api-key': OPENSEA_API_KEY } });
+    if (!res.ok) throw new Error(`last-sale poll HTTP ${res.status}`);
+    const data = await res.json();
+    const ev = (data.asset_events || [])[0];
+    const tokenId = ev?.nft?.identifier;
+    if (!ev || !tokenId) {
+      console.log('[relay] last-sale poll: collection has no recorded sale at all');
+      return;
+    }
+    const tsMs = ev.event_timestamp ? parseOpenSeaTimestamp(ev.event_timestamp) : Date.now();
+    noteLastSaleEver(tokenId, Number.isFinite(tsMs) ? tsMs : Date.now());
+    console.log(`[relay] last-sale poll: token ${tokenId} at ${new Date(lastSaleEver.timestamp).toISOString()}`);
+  } catch (err) {
+    console.error('[relay] last-sale poll failed:', err.message || err);
+  }
+}
+
 // Every live event (stream or REST backstop) goes through this
 // single function, so both the ring buffer and the 24h log always
 // reflect exactly what was actually broadcast. timestampMs is
@@ -108,14 +148,16 @@ function broadcastEvent(tokenId, type, timestampMs) {
   const ts = timestampMs || Date.now();
   recordBroadcast(tokenId, type, ts);
   recordDailyEvent(tokenId, type, ts);
+  if (type === 'sale') noteLastSaleEver(tokenId, ts);
   broadcast({ tokenIndex: tokenIdToIndex(tokenId), type, timestamp: ts });
 }
 
-// GET /recent-events: every sale / new offer
-// broadcast in the last 24h, regardless of whether a browser was
-// connected when it happened. This is what events.js fetches once on
-// every page load so all concerned Genuine Undead blink on arrival,
-// not just events that land while the tab is already open.
+// GET /recent-events: every sale / new offer broadcast in the last
+// 24h, regardless of whether a browser was connected when it
+// happened, PLUS the single true "last sale ever" (see lastSaleEver
+// above) - independent of that same 24h window, so the green "last
+// sale" marker still has something to show even on a quiet day. This
+// is what events.js fetches once on every page load.
 app.get('/recent-events', (req, res) => {
   pruneDailyEvents();
   res.json({
@@ -123,7 +165,10 @@ app.get('/recent-events', (req, res) => {
       tokenIndex: tokenIdToIndex(e.tokenId),
       type: e.type,
       timestamp: e.timestamp
-    }))
+    })),
+    lastSale: lastSaleEver
+      ? { tokenIndex: tokenIdToIndex(lastSaleEver.tokenId), timestamp: lastSaleEver.timestamp }
+      : null
   });
 });
 
@@ -260,31 +305,6 @@ function buildEventsUrl(since, eventTypes, cursor) {
   return `https://api.opensea.io/api/v2/events/collection/${COLLECTION_SLUG}?${params.toString()}`;
 }
 
-// -----------------------------------------------------------------
-// TEMPORARY DIAGNOSTIC ENDPOINT (2026-08-29) — remove once the
-// "0 raw events" mystery is solved. Makes the exact same request
-// pollSales() makes and hands back OpenSea's raw response so it can
-// be inspected from a plain browser tab, since Shell access needs a
-// paid Render plan. Never exposes OPENSEA_API_KEY - the key is only
-// ever sent as a request header, never present in the URL or in
-// anything reflected back here.
-// -----------------------------------------------------------------
-app.get('/debug-opensea', async (req, res) => {
-  const since = Math.floor(Date.now() / 1000) - DAY_MS / 1000 - OVERLAP_SECONDS;
-  const url = buildEventsUrl(since, ['sale'], null);
-  try {
-    const openseaRes = await fetch(url, { headers: { 'x-api-key': OPENSEA_API_KEY } });
-    const bodyText = await openseaRes.text();
-    res.status(200).json({
-      requestUrl: url,
-      openseaStatus: openseaRes.status,
-      openseaBody: bodyText
-    });
-  } catch (err) {
-    res.status(500).json({ error: err.message || String(err) });
-  }
-});
-
 // Only these OpenSea event_type values map onto the site's legend
 // (sale / new offer - see config.js EVENT_COLORS).
 // "listing", "transfer", "cancel", "redemption" and any unrecognized
@@ -406,9 +426,11 @@ function pollOffers() {
 
 pollSales();   // catch up on ventes immediatement au demarrage/reveil
 pollOffers();  // idem pour les nouvelles offres
+pollLastSaleEver(); // le vrai "last sale ever", independant de la fenetre 24h
 
 setInterval(pollSales, SALE_POLL_INTERVAL_MS);
 setInterval(pollOffers, OFFER_POLL_INTERVAL_MS);
+setInterval(pollLastSaleEver, SALE_POLL_INTERVAL_MS);
 
 // -----------------------------------------------------------------
 // TRAIT RARITY (collection-wide)
